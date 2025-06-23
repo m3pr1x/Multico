@@ -1,38 +1,46 @@
 # -*- coding: utf-8 -*-
-"""app.py – Générateur B2B Units (PF1)
-Streamlit app à placer dans un dépôt GitHub puis à déployer sur Streamlit Cloud.
-Dépendances : pandas, streamlit, openpyxl (pas besoin de xlsxwriter)
+"""app.py – Générateur multiconnexion (PF1)
+Dépendances : pandas, streamlit, **openpyxl** ou **xlsxwriter** (au moins l’un des deux).
 """
 
-import pandas as pd
+import importlib.util
 from datetime import datetime
 from io import BytesIO
+
+import pandas as pd
 import streamlit as st
 
-# ───────────────────── CONFIG ─────────────────────
+# ───────────────────────── CONFIG ─────────────────────────
 st.set_page_config(page_title="multiconnexion", page_icon="📦")
 
-st.title("📦 Outil de multiconnextion)")
+st.title("📦 Outil de multiconnexion")
 st.markdown(
-    "Déposez un fichier CSV ou Excel contenant les colonnes **Numéro de compte**, **Raison sociale** et **Adresse**. "
-    "Renseignez les champs ci‑dessous puis cliquez sur **Générer** pour télécharger un fichier Excel prêt à importer."
+    "Déposez un fichier CSV ou Excel contenant les colonnes **Numéro de compte**, **Raison sociale** et **Adresse**."
 )
 
-# ───────────────────── UPLOAD ─────────────────────
+# ───────────────────────── Détection moteur Excel ─────────────────────────
+if importlib.util.find_spec("openpyxl") is not None:
+    EXCEL_ENGINE = "openpyxl"
+elif importlib.util.find_spec("xlsxwriter") is not None:
+    EXCEL_ENGINE = "xlsxwriter"
+else:
+    EXCEL_ENGINE = None  # on gèrera l’erreur plus loin
+
+# ───────────────────────── UPLOAD ─────────────────────────
 uploaded = st.file_uploader("📄 Fichier comptes", type=("csv", "xlsx", "xls"))
 
-# ───────────────────── PARAMÈTRES ─────────────────────
+# ───────────────────────── PARAMÈTRES ─────────────────────────
 col1, col2 = st.columns(2)
 with col1:
-    entreprise = st.text_input("🏢 Entreprise", key="ent")
+    entreprise = st.text_input("🏢 Entreprise")
 with col2:
-    fot = st.text_input("🆔 True or False", key="T or F")
+    flag_tf = st.text_input("✅ True / False (texte)")
 
-# ───────────────────── UTILS ─────────────────────
+# ───────────────────────── UTILITAIRES ─────────────────────────
 
 @st.cache_data(show_spinner=False)
 def read_any(file):
-    """Lit un CSV ou Excel (premier onglet) en gérant encodages."""
+    """Lit un CSV (encodages courants) ou un Excel (.xlsx) avec openpyxl."""
     name = file.name.lower()
     if name.endswith(".csv"):
         for enc in ("utf-8", "latin1", "cp1252"):
@@ -42,11 +50,14 @@ def read_any(file):
             except UnicodeDecodeError:
                 file.seek(0)
         raise ValueError("Encodage CSV non reconnu.")
-    # Excel
+
+    # Excel : nécessite openpyxl
+    if EXCEL_ENGINE != "openpyxl":
+        raise ImportError("Le module openpyxl est requis pour lire les fichiers Excel .xlsx.")
+
     return pd.read_excel(file, engine="openpyxl")
 
-def build_pf1(df: pd.DataFrame, ent: str, fot: str) -> pd.DataFrame:
-    """Construit le DataFrame PF1 à partir des colonnes obligatoires."""
+def build_pf1(df: pd.DataFrame, ent: str, flag: str) -> pd.DataFrame:
     required = {"Numéro de compte", "Raison sociale", "Adresse"}
     missing = required - set(df.columns)
     if missing:
@@ -69,39 +80,41 @@ def build_pf1(df: pd.DataFrame, ent: str, fot: str) -> pd.DataFrame:
             row["Adresse"],
             f"frx-variant-{ent}-configuration-set",
             f"PC_{ent}",
-            fot,
+            flag,
         ]
 
     return pf1
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """Renvoie un fichier Excel en mémoire (engine = openpyxl)."""
+    if EXCEL_ENGINE is None:
+        raise ImportError("Installez openpyxl ou xlsxwriter pour exporter le fichier Excel.")
+
     buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    with pd.ExcelWriter(buffer, engine=EXCEL_ENGINE) as writer:
         df.to_excel(writer, index=False)
     buffer.seek(0)
     return buffer.getvalue()
 
-# ───────────────────── ACTION ─────────────────────
+# ───────────────────────── ACTION ─────────────────────────
 
 if st.button("🚀 Générer"):
-    if uploaded is None or not entreprise or not fot:
+    if uploaded is None or not entreprise or not flag_tf:
         st.warning("Veuillez déposer un fichier et renseigner tous les champs.")
     else:
         try:
-            src = read_any(uploaded)
-            pf1_df = build_pf1(src, entreprise.strip(), fot.strip())
+            df_src = read_any(uploaded)
+            pf1_df = build_pf1(df_src, entreprise.strip(), flag_tf.strip())
 
             st.success("✅ Fichier généré !")
             st.dataframe(pf1_df.head())
 
             filename = (
-                f"B2B Units creation_{entreprise.replace(' ', '_')}_"
+                f"B2B_Units_creation_{entreprise.replace(' ', '_')}_"
                 f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             )
 
             st.download_button(
-                label="📥 Télécharger le fichier Excel",
+                "📥 Télécharger le fichier Excel",
                 data=to_excel_bytes(pf1_df),
                 file_name=filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
