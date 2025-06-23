@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """app.py – Générateur multiconnexion (PF1)
-Dépendances : pandas, streamlit, openpyxl **ou** xlsxwriter (au moins l’un des deux).
-La colonne **ViewMasterCatalog** est désormais une *chaîne* "True" / "False" au lieu d’un booléen.
+Fonctionne même sans openpyxl/xlsxwriter : si aucun moteur Excel n’est dispo, l’app exporte un CSV.
+Dépendances minimales : pandas, streamlit (openpyxl ou xlsxwriter *optionnels*).
 """
+
+from __future__ import annotations
 
 import importlib.util
 from datetime import datetime
@@ -14,38 +16,35 @@ import streamlit as st
 # ───────────────────────── CONFIG ─────────────────────────
 st.set_page_config(page_title="multiconnexion", page_icon="📦")
 
-st.title("📦 Outil de multiconnexion – génération PF1")
+st.title("📦 Générateur PF1 – multiconnexion")
 st.markdown(
-    "Déposez un fichier CSV ou Excel contenant les colonnes **Numéro de compte**, **Raison sociale** et **Adresse**.\n\n"
-    "Les colonnes générées seront : `uid`, `name`, `locName`, `CXmIAssignedConfiguration`, `pcCompoundProfile`, `ViewMasterCatalog`.\n"
-    "• `uid` = Numéro de compte\n"
-    "• `name` et `locName` = Raison sociale\n"
-    "• `ViewMasterCatalog` = chaîne \"True\" ou \"False\" choisie ci‑dessous"
+    "Chargez un fichier CSV ou Excel contenant **Numéro de compte**, **Raison sociale** et **Adresse**."\
+    " Le résultat peut être exporté en Excel (si openpyxl/xlsxwriter est installé) ou, à défaut, en CSV."
 )
 
-# ───────────────────────── Détection moteur Excel ─────────────────────────
+# ───────────────────────── Détection moteurs Excel ─────────────────────────
 if importlib.util.find_spec("openpyxl") is not None:
     EXCEL_ENGINE = "openpyxl"
 elif importlib.util.find_spec("xlsxwriter") is not None:
     EXCEL_ENGINE = "xlsxwriter"
 else:
-    EXCEL_ENGINE = None  # sera traité plus loin
+    EXCEL_ENGINE = None  # aucun moteur Excel dispo
 
 # ───────────────────────── UPLOAD ─────────────────────────
 uploaded = st.file_uploader("📄 Fichier comptes", type=("csv", "xlsx", "xls"))
 
-# ───────────────────────── PARAMÈTRES ─────────────────────────
+# ───────────────────────── PARAMS ─────────────────────────
 col1, col2 = st.columns(2)
 with col1:
-    entreprise = st.text_input("🏢 Entreprise (ex. DALKIA)")
+    entreprise = st.text_input("🏢 Entreprise", placeholder="Ex. DALKIA")
 with col2:
-    vm_choice = st.radio("🗂️ ViewMasterCatalog ?", options=["True", "False"], horizontal=True)
+    vm_choice = st.radio("🗂️ ViewMasterCatalog", options=["True", "False"], horizontal=True)
 
-# ───────────────────────── UTILITAIRES ─────────────────────────
+# ───────────────────────── HELPERS ─────────────────────────
 
 @st.cache_data(show_spinner=False)
 def read_any(file):
-    """Lit CSV (encodages courants) ou Excel (premier onglet) via openpyxl."""
+    """Lit CSV ou Excel."""
     name = file.name.lower()
     if name.endswith(".csv"):
         for enc in ("utf-8", "latin1", "cp1252"):
@@ -54,77 +53,71 @@ def read_any(file):
                 return pd.read_csv(file, encoding=enc)
             except UnicodeDecodeError:
                 file.seek(0)
-        raise ValueError("Encodage CSV non reconnu ; essayez UTF‑8, Latin‑1 ou CP1252.")
+        raise ValueError("Encodage CSV non reconnu.")
 
-    # Excel : nécessite openpyxl
+    # Excel → nécessite openpyxl
     if EXCEL_ENGINE != "openpyxl":
         raise ImportError("Le module openpyxl est requis pour lire les fichiers Excel .xlsx.")
 
     return pd.read_excel(file, engine="openpyxl")
 
 def build_pf1(df: pd.DataFrame, ent: str, vm_flag: str) -> pd.DataFrame:
-    """Construit le DataFrame PF1.\n    - name et locName = Raison sociale\n    - ViewMasterCatalog = vm_flag ("True"/"False")"""
-    required = {"Numéro de compte", "Raison sociale", "Adresse"}
-    missing = required - set(df.columns)
+    req = {"Numéro de compte", "Raison sociale", "Adresse"}
+    missing = req - set(df.columns)
     if missing:
         raise ValueError(f"Colonnes manquantes : {', '.join(sorted(missing))}")
 
     pf1 = pd.DataFrame(columns=[
-        "uid",
-        "name",
-        "locName",
-        "CXmIAssignedConfiguration",
-        "pcCompoundProfile",
-        "ViewMasterCatalog",
+        "uid", "name", "locName",
+        "CXmIAssignedConfiguration", "pcCompoundProfile", "ViewMasterCatalog",
     ])
 
     for code in df["Numéro de compte"].dropna().unique():
         row = df.loc[df["Numéro de compte"] == code].iloc[0]
-        raison_sociale = row["Raison sociale"]
+        rs = row["Raison sociale"]
         pf1.loc[len(pf1)] = [
-            code,                                # uid
-            raison_sociale,                      # name
-            raison_sociale,                      # locName (identique)
+            code,
+            rs,
+            rs,  # locName = name
             f"frx-variant-{ent}-configuration-set",
             f"PC_{ent}",
-            vm_flag,                             # "True" / "False" (string)
+            vm_flag,
         ]
-
     return pf1
 
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    if EXCEL_ENGINE is None:
-        raise ImportError("Installez openpyxl ou xlsxwriter pour exporter le fichier Excel.")
-
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine=EXCEL_ENGINE) as writer:
-        df.to_excel(writer, index=False)
-    buffer.seek(0)
-    return buffer.getvalue()
+def export_bytes(df: pd.DataFrame):
+    """Retourne (bytes, extension, mime) en fonction des moteurs dispo."""
+    if EXCEL_ENGINE:
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine=EXCEL_ENGINE) as writer:
+            df.to_excel(writer, index=False)
+        buffer.seek(0)
+        return buffer.getvalue(), "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    # Fallback CSV utf‑8
+    return df.to_csv(index=False).encode("utf-8"), "csv", "text/csv"
 
 # ───────────────────────── ACTION ─────────────────────────
 
 if st.button("🚀 Générer le PF1"):
     if uploaded is None or not entreprise:
-        st.warning("Veuillez déposer un fichier et renseigner le nom d’entreprise.")
+        st.warning("Veuillez déposer un fichier et saisir le nom d’entreprise.")
     else:
         try:
             df_src = read_any(uploaded)
-            pf1_df = build_pf1(df_src, entreprise.strip(), vm_choice)
+            pf1 = build_pf1(df_src, entreprise.strip(), vm_choice)
 
-            st.success("✅ Fichier généré !")
-            st.dataframe(pf1_df.head())
+            st.success("✅ Fichier généré ! Aperçu :")
+            st.dataframe(pf1.head())
 
-            filename = (
-                f"B2B_Units_creation_{entreprise.replace(' ', '_')}_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
+            data_bytes, ext, mime = export_bytes(pf1)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"PF1_{entreprise.replace(' ', '_')}_{ts}.{ext}"
 
             st.download_button(
-                label="📥 Télécharger le fichier Excel",
-                data=to_excel_bytes(pf1_df),
+                label=f"📥 Télécharger le fichier {ext.upper()}",
+                data=data_bytes,
                 file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                mime=mime,
             )
         except Exception as e:
             st.error(f"❌ Erreur : {e}")
