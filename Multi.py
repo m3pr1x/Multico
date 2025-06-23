@@ -1,123 +1,196 @@
 # -*- coding: utf-8 -*-
-"""app.py – Générateur multiconnexion (PF1)
-Version simplifiée : impose explicitement `openpyxl` comme moteur Excel et l’importe en début de script.
-Ajoutez simplement `openpyxl` dans votre *requirements.txt* : 
-```
-pandas
-streamlit
-openpyxl
-```
-```bash
-pip install -r requirements.txt
-```
+"""app.py – Générateur tables PF1…PF6
+Déployable sur Streamlit Cloud. Ajoutez au dépôt :
+    requirements.txt ->
+        pandas
+        streamlit
+        openpyxl
+        postal
+        libpostal
+Si libpostal n’est disponible que via apt/brew, ajoutez la commande
+correspondante dans le README du repo.
 """
 
 from __future__ import annotations
 
+import io
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from postal.parser import parse_address  # libpostal (wrapper Python)
 
-# ───────────────────────── DEPENDENCY CHECK ─────────────────────────
+# ───────────────────────── DEP CHECK ─────────────────────────
 try:
-    import openpyxl  # noqa: F401 – assure l’import
+    import openpyxl  # noqa: F401
 except ImportError as e:
-    raise ImportError(
-        "Le module 'openpyxl' est requis pour lire/écrire les fichiers Excel (.xlsx).\n"
-        "Installez-le avec : pip install openpyxl"
-    ) from e
+    raise ImportError("openpyxl requis : pip install openpyxl") from e
 
-EXCEL_ENGINE = "openpyxl"  # moteur unique désormais
+ENGINE = "openpyxl"
 
-# ───────────────────────── CONFIG ─────────────────────────
-st.set_page_config(page_title="multiconnexion", page_icon="📦")
+# ───────────────────────── PAGE SETUP ─────────────────────────
+st.set_page_config(page_title="PF1‑PF6 generator", page_icon="📦", layout="wide")
 
-st.title("📦 Générateur PF1 – multiconnexion (export Excel)")
+st.title("📦 Générateur PF1 → PF6")
 st.markdown(
-    "Chargez un fichier CSV ou Excel contenant **Numéro de compte**, **Raison sociale** et **Adresse**.\n\n"
-    "Le résultat sera exporté en **Excel (.xlsx)** à l’aide du moteur openpyxl."
-)
+    "Uploadez un fichier CSV ou Excel respectant **le template ci‑dessous**.\n"
+    "Remplissez les champs, puis cliquez sur *Générer* pour télécharger les 6 fichiers Excel.")
 
-# ───────────────────────── UPLOAD ─────────────────────────
-uploaded = st.file_uploader("📄 Fichier comptes", type=("csv", "xlsx", "xls"))
+# ───────────────────────── TEMPLATE SECTION ─────────────────────────
+TEMPLATE_COLS = [
+    "Numéro de compte",   # ex: 12345678901
+    "Raison sociale",     # ex: ALPHA SARL
+    "Adresse",            # ex: 10 Rue de la Paix 75002 Paris
+    "ManagingBranch",     # ex: PARIS01
+]
 
-# ───────────────────────── PARAMÈTRES ─────────────────────────
-col1, col2 = st.columns(2)
-with col1:
-    entreprise = st.text_input("🏢 Entreprise", placeholder="Ex. DALKIA")
-with col2:
-    vm_choice = st.radio("🗂️ ViewMasterCatalog", options=["True", "False"], index=0, horizontal=True)
+template_df = pd.DataFrame([{c: "" for c in TEMPLATE_COLS}])
+buf_template = io.BytesIO()
+template_df.to_excel(buf_template, index=False, engine=ENGINE)
+buf_template.seek(0)
 
-# ───────────────────────── UTILITAIRES ─────────────────────────
+with st.expander("📑 Télécharger le template dfrEcu.xlsx"):
+    st.download_button("📥 Template Excel", buf_template, file_name="dfrecu_template.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.dataframe(template_df)
 
-@st.cache_data(show_spinner=False)
-def read_any(file):
-    name = file.name.lower()
+# ───────────────────────── UPLOAD & PARAMS ─────────────────────────
+file = st.file_uploader("📄 Fichier dfrecu", type=("csv", "xlsx", "xls"))
+
+colA, colB, colC = st.columns(3)
+with colA:
+    entreprise = st.text_input("🏢 Entreprise", placeholder="DALKIA").strip()
+with colB:
+    punchout_user_id = st.text_input("👤 punchoutUserID", placeholder="user001")
+with colC:
+    domain = st.selectbox("🌐 Domain", ["NetworkID", "DUNS"])
+
+identity = st.text_input("🆔 Identity (string)")
+vm_choice = st.radio("ViewMasterCatalog?", ["True", "False"], horizontal=True)
+
+# ───────────────────────── HELPERS ─────────────────────────
+
+def read_any(uploaded):
+    name = uploaded.name.lower()
     if name.endswith(".csv"):
         for enc in ("utf-8", "latin1", "cp1252"):
             try:
-                file.seek(0)
-                return pd.read_csv(file, encoding=enc)
+                uploaded.seek(0)
+                return pd.read_csv(uploaded, encoding=enc)
             except UnicodeDecodeError:
-                file.seek(0)
-        raise ValueError("Encodage CSV non reconnu.")
+                uploaded.seek(0)
+        st.error("Encodage CSV non reconnu.")
+    else:
+        return pd.read_excel(uploaded, engine=ENGINE)
 
-    return pd.read_excel(file, engine=EXCEL_ENGINE)
 
-def build_pf1(df: pd.DataFrame, ent: str, vm_flag: str) -> pd.DataFrame:
-    required = {"Numéro de compte", "Raison sociale", "Adresse"}
-    missing = required - set(df.columns)
-    if missing:
+def split_address(addr: str) -> dict:
+    parts = {"num": "", "voie": "", "cp": "", "ville": "", "pays": "FR"}
+    for val, label in parse_address(addr or ""):
+        if label == "house_number":
+            parts["num"] = val
+        elif label in {"road", "footway", "path"}:
+            parts["voie"] = val
+        elif label == "postcode":
+            parts["cp"] = val
+        elif label in {"city", "town", "village", "suburb"}:
+            parts["ville"] = val
+        elif label == "country":
+            parts["pays"] = val
+    return parts
+
+
+def to_excel_bytes(df):
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine=ENGINE) as w:
+        df.to_excel(w, index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+# ───────────────────────── CORE GENERATE ─────────────────────────
+
+def generate_tables(df: pd.DataFrame):
+    required = set(TEMPLATE_COLS)
+    if missing := required - set(df.columns):
         raise ValueError(f"Colonnes manquantes : {', '.join(sorted(missing))}")
 
+    sealed = "false"
+
+    # PF1
     pf1 = pd.DataFrame(columns=[
         "uid", "name", "locName",
         "CXmIAssignedConfiguration", "pcCompoundProfile", "ViewMasterCatalog",
     ])
 
-    for code in df["Numéro de compte"].dropna().unique():
-        row = df.loc[df["Numéro de compte"] == code].iloc[0]
-        rs = row["Raison sociale"]
+    pf2 = pd.DataFrame(columns=[
+        "B2B Unit", "ADRESSE / Numéro de rue", "ADRESSE / rue",
+        "ADRESSEE Code postal", "ADRESSE / Ville", "ADRESSE / Pays/Région",
+        "INFORMATIONS D'ADRESSE SUPPLÉMENTAIRES / Téléphone 1",
+    ])
+
+    pf3 = pd.DataFrame(columns=[
+        "B2BUnitID", "itemtype", "managingBranches", "punchoutUserID", "sealed",
+    ])
+
+    pf4 = pd.DataFrame(columns=["aliasName", "branch", "punchoutUserID", "sealed"])
+    pf5 = pd.DataFrame(columns=["B2BUnitID", "punchoutUserID"])
+    pf6 = pd.DataFrame(columns=["number", "domain", "identity"])
+
+    for _, r in df.iterrows():
+        code = r["Numéro de compte"]
+        # PF1
         pf1.loc[len(pf1)] = [
-            code,
-            rs,
-            rs,
-            f"frx-variant-{ent}-configuration-set",
-            f"PC_{ent}",
-            vm_flag,
+            code, r["Raison sociale"], r["Adresse"],
+            f"frx-variant-{entreprise}-configuration-set",
+            f"PC_{entreprise}", vm_choice,
         ]
-    return pf1
+        # PF2
+        addr = split_address(r["Adresse"])
+        pf2.loc[len(pf2)] = [
+            code, addr["num"], addr["voie"], addr["cp"], addr["ville"], addr["pays"], "",
+        ]
+        # PF3
+        managing = r["ManagingBranch"]
+        pf3.loc[len(pf3)] = [
+            code, "PunchoutAccountAndBranchAssociation", managing, punchout_user_id, sealed,
+        ]
+        # PF4
+        pf4.loc[len(pf4)] = [managing, managing, punchout_user_id, sealed]
+        # PF5
+        pf5.loc[len(pf5)] = [code, punchout_user_id]
+        # PF6
+        pf6.loc[len(pf6)] = [code, domain, identity]
 
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine=EXCEL_ENGINE) as writer:
-        df.to_excel(writer, index=False)
-    buffer.seek(0)
-    return buffer.getvalue()
+    return pf1, pf2, pf3, pf4, pf5, pf6
 
-# ───────────────────────── ACTION ─────────────────────────
+# ───────────────────────── ACTION BUTTON ─────────────────────────
 
-if st.button("🚀 Générer le PF1 (.xlsx)"):
-    if uploaded is None or not entreprise:
-        st.warning("Veuillez déposer un fichier et saisir le nom d’entreprise.")
-    else:
-        try:
-            df_src = read_any(uploaded)
-            pf1 = build_pf1(df_src, entreprise.strip(), vm_choice)
+if st.button("🚀 Générer PF1‑PF6"):
+    if not (file and entreprise and punchout_user_id and identity):
+        st.warning("Veuillez charger un fichier et renseigner tous les champs.")
+        st.stop()
 
-            st.success("✅ Fichier généré ! Aperçu :")
-            st.dataframe(pf1.head())
+    try:
+        src = read_any(file)
+        pf1, pf2, pf3, pf4, pf5, pf6 = generate_tables(src)
+    except Exception as e:
+        st.error(f"❌ Erreur : {e}")
+        st.stop()
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"PF1_{entreprise.replace(' ', '_')}_{ts}.xlsx"
+    st.success("✅ Tables générées !")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            st.download_button(
-                label="📥 Télécharger le fichier Excel",
-                data=to_excel_bytes(pf1),
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        except Exception as e:
-            st.error(f"❌ Erreur : {e}")
+    for name, df in zip(
+        ("PF1", "PF2", "PF3", "PF4", "PF5", "PF6"),
+        (pf1, pf2, pf3, pf4, pf5, pf6),
+    ):
+        file_bytes = to_excel_bytes(df)
+        fname = f"{name}_{entreprise}_{ts}.xlsx".replace(" ", "_")
+        st.download_button(f"⬇️ {name}", file_bytes, file_name=fname,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Aperçu PF1
+    st.subheader("Aperçu PF1")
+    st.dataframe(pf1.head(20), use_container_width=True)
